@@ -1,7 +1,7 @@
 FROM python:3.12-slim
 
 WORKDIR /app
-COPY runtime/runtime.py ./
+COPY runtime.py ./
 
 RUN pip install requests
 

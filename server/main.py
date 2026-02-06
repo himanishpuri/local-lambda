@@ -1,5 +1,7 @@
 import logging
 import json
+import os
+import aiofiles
 from fastapi import FastAPI, Request
 from pydantic import BaseModel
 from scheduler import get_env
@@ -7,6 +9,9 @@ from scheduler import get_env
 app = FastAPI()
 
 logging.basicConfig(level=logging.INFO)
+
+# Get the project root directory
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 @app.post("/invoke/{function_name}")
 async def invoke(function_name: str, request: Request):
@@ -16,8 +21,10 @@ async def invoke(function_name: str, request: Request):
         payload = await request.json()
     except json.JSONDecodeError:
         logging.info("No payload provided, using default event.json")
-        with open(f"functions/{function_name}/event.json") as f: # temporary default
-            payload = json.load(f)
+        event_file = os.path.join(PROJECT_ROOT, f"functions/{function_name}/event.json")
+        async with aiofiles.open(event_file, 'r') as f:
+            content = await f.read()
+            payload = json.loads(content)
 
     env = get_env(function_name)
     result = env.invoke(payload)

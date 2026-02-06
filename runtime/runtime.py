@@ -1,7 +1,13 @@
 import requests
 import os
-import handler
+import sys
 import logging
+
+# Add function directory to path so we can import handler
+LAMBDA_TASK_ROOT = os.environ.get("LAMBDA_TASK_ROOT", "/function")
+sys.path.insert(0, LAMBDA_TASK_ROOT)
+
+import handler
 
 API = os.environ["RUNTIME_API"]
 logging.basicConfig(level=logging.INFO)
