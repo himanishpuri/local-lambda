@@ -1,9 +1,11 @@
-from fastapi import FastAPI, Request, Response
 import json
 import threading
 import queue
 import uuid
 import uvicorn
+import logging
+import subprocess
+from fastapi import FastAPI, Request, Response
 
 class RuntimeAPI:
     def __init__(self):
@@ -34,6 +36,12 @@ class RuntimeAPI:
     def attach(self, cid):
         self.container_id = cid
         self.dead = False
+
+    def kill(self):
+        if not self.dead:
+            logging.info(f"Killing container {self.container_id}")
+            subprocess.run(["docker", "kill", self.container_id], check=False)
+            self.dead = True
 
     def invoke(self, payload):
         rid = str(uuid.uuid4())
