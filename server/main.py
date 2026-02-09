@@ -10,7 +10,6 @@ app = FastAPI()
 
 logging.basicConfig(level=logging.INFO)
 
-# Get the project root directory
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 @app.post("/invoke/{function_name}")
@@ -27,9 +26,14 @@ async def invoke(function_name: str, request: Request):
             payload = json.loads(content)
 
     env = get_env(function_name)
-    result = env.invoke(payload)
-    logging.info(f"Invocation result: {result}")
-    return result
+    
+    try:
+        result = env.invoke(payload)
+        logging.info(f"Invocation result: {result}")
+        return result
+    except Exception as e:
+        logging.error(f"Invocation failed: {e}")
+        return {"errorMessage": str(e), "errorType": "ExecutionError"}
 
 if __name__ == "__main__":
     import uvicorn

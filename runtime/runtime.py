@@ -2,20 +2,21 @@ import requests
 import os
 import sys
 import logging
+import socket
 
-# Add function directory to path so we can import handler
 LAMBDA_TASK_ROOT = os.environ.get("LAMBDA_TASK_ROOT", "/function")
 sys.path.insert(0, LAMBDA_TASK_ROOT)
 
 import handler
 
 API = os.environ["RUNTIME_API"]
+CONTAINER_ID = socket.gethostname()
 logging.basicConfig(level=logging.INFO)
 
 while True:
     logging.info("Waiting for next event")
     try:
-        r = requests.get(f"http://{API}/next")
+        r = requests.get(f"http://{API}/{CONTAINER_ID}/next")
         r.raise_for_status()
     except requests.exceptions.RequestException as e:
         logging.error(f"Failed to get next event: {e}")
