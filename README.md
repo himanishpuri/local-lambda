@@ -174,6 +174,9 @@ docker
 | Cold start    | ~100ms               | 100ms - 10s (varies by runtime) |
 | Billing       | N/A                  | Per-ms, per-GB memory           |
 
+## Reference
+[AWS Lambda Architecture Deep Dive](https://joudwawad.medium.com/aws-lambda-architecture-deep-dive-bef856b9b2c4)
+
 ## License
 
 UNLICENSED
