@@ -6,7 +6,7 @@ A working implementation of AWS Lambda's core runtime behavior, including:
 
 ### 1️⃣ Invocation Timeouts (Hard Kill)
 
-- **Timeout:** 15 seconds (configurable)
+- **Timeout:** 15 seconds (edit `timeout` in `Environment.invoke`, scheduler.py)
 - **Behavior:** Container is killed if handler exceeds timeout
 - **Implementation:** Host process tracks execution time and sends `docker kill`
 - **Just like AWS:** Lambda never trusts user code to exit gracefully
@@ -24,19 +24,19 @@ A working implementation of AWS Lambda's core runtime behavior, including:
 - Prevents cross-container event stealing
 - Container calls `/{container_id}/next` which blocks until event arrives
 
-### 5️⃣ Concurrent Execution (Per-Function Container Pool)
+### 4️⃣ Concurrent Execution (Per-Function Container Pool)
 
 - **Pool:** up to `MAX_PER_FN` (default 3) warm containers **per function**
 - **Behavior:** concurrent invokes fan out across the pool; when all are busy, callers block until one frees
 - **Implementation:** `Pool` in `scheduler.py` — `acquire`/`release` guarded by a `threading.Condition`; requests run off the event loop via `run_in_threadpool`
 - **Just like AWS:** one execution environment serves one request at a time; scale = more environments
 
-### 4️⃣ Container Lifecycle Management
+### 5️⃣ Container Lifecycle Management
 
-- Cold starts: New container created on first invocation
-- Warm reuse: Same container reused for subsequent calls
-- Function switching: Old container killed when switching functions
-- Proper cleanup: Containers deleted after timeout or eviction
+- Cold starts: New container created when no warm one is free (and pool below `MAX_PER_FN`)
+- Warm reuse: A freed container is reused for the next invoke of the same function
+- Per-function pools: Each function keeps its own containers; calling a different function does **not** evict them — they persist until idle eviction
+- Cleanup: Containers are killed on timeout, on pickup failure, or by the idle reaper
 
 ## Architecture
 
@@ -168,12 +168,24 @@ This is NOT optional Lambda behavior — it's fundamental:
 
 ### Timeout Implementation
 
+Two phases share one budget (`runtime_api.py:invoke`). Phase 1 waits for the container to pick
+up the event (cold-start latency); Phase 2 waits for the result within whatever time is left.
+Either expiry kills the container — Lambda never trusts user code to exit.
+
 ```python
-while rid not in self.responses:
-    if time.time() - start > timeout:
-        subprocess.run(["docker", "kill", container_id])
-        raise Exception("Function timed out")
-    time.sleep(0.01)
+# Phase 1 — wait for pickup
+if not picked_event.wait(timeout=total_timeout):
+    subprocess.run(["docker", "kill", container_id], check=False)
+    raise RuntimeError("Container failed to start or pick up event")
+
+remaining = total_timeout - (time.time() - start_time)
+
+# Phase 2 — wait for the handler result
+done = threading.Event()
+self.response_events[rid] = done
+if not done.wait(timeout=remaining):
+    subprocess.run(["docker", "kill", container_id], check=False)
+    raise TimeoutError("Function execution timed out")
 ```
 
 ### Idle Eviction Thread
@@ -198,19 +210,19 @@ def reap_idle():
 ## Requirements
 
 ```bash
-pip install fastapi uvicorn aiofiles requests
+pip install -r server/requirements.txt   # fastapi uvicorn aiofiles requests pytest
 docker
 ```
 
 ## Real AWS Lambda Differences
 
-| Feature       | This Implementation              | Real AWS Lambda                 |
-| ------------- | -------------------------------- | ------------------------------- |
-| Timeout       | 15s                              | 1s - 900s (configurable)        |
-| Idle eviction | 30s                              | ~10-60 minutes (varies)         |
-| Concurrency   | N per function (pool, default 3) | Thousands (auto-scaling)        |
-| Cold start    | ~100ms                           | 100ms - 10s (varies by runtime) |
-| Billing       | N/A                              | Per-ms, per-GB memory           |
+| Feature       | This Implementation               | Real AWS Lambda                 |
+| ------------- | --------------------------------- | ------------------------------- |
+| Timeout       | 15s                               | 1s - 900s (configurable)        |
+| Idle eviction | 30s                               | ~10-60 minutes (varies)         |
+| Concurrency   | N per function (pool, default 3)  | Thousands (auto-scaling)        |
+| Cold start    | `docker run` latency (unmeasured) | 100ms - 10s (varies by runtime) |
+| Billing       | N/A                               | Per-ms, per-GB memory           |
 
 ## Reference
 
