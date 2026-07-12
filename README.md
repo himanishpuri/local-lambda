@@ -24,6 +24,13 @@ A working implementation of AWS Lambda's core runtime behavior, including:
 - Prevents cross-container event stealing
 - Container calls `/{container_id}/next` which blocks until event arrives
 
+### 5️⃣ Concurrent Execution (Per-Function Container Pool)
+
+- **Pool:** up to `MAX_PER_FN` (default 3) warm containers **per function**
+- **Behavior:** concurrent invokes fan out across the pool; when all are busy, callers block until one frees
+- **Implementation:** `Pool` in `scheduler.py` — `acquire`/`release` guarded by a `threading.Condition`; requests run off the event loop via `run_in_threadpool`
+- **Just like AWS:** one execution environment serves one request at a time; scale = more environments
+
 ### 4️⃣ Container Lifecycle Management
 
 - Cold starts: New container created on first invocation
@@ -33,34 +40,68 @@ A working implementation of AWS Lambda's core runtime behavior, including:
 
 ## Architecture
 
+```mermaid
+flowchart TD
+    client([curl / client])
+
+    subgraph host["Host process"]
+        api["FastAPI Server (main.py)<br/>:9000 — POST /invoke/{fn}"]
+        sched["Scheduler (scheduler.py)<br/>Pool: per-function warm containers<br/>acquire · release · reap_idle"]
+        rtapi["RuntimeAPI (runtime_api.py)<br/>:5001 — Lambda Runtime API<br/>/next (blocks) · /response · /error"]
+    end
+
+    subgraph pool["Per-function container pool (up to MAX_PER_FN)"]
+        c1["Docker container (runtime.py)<br/>poll /next → handler → POST /response"]
+        c2["Docker container"]
+        c3["Docker container"]
+    end
+
+    client -->|"HTTP invoke"| api
+    api -->|"acquire(fn)"| sched
+    sched -->|"cold start: docker run"| pool
+    api -->|"enqueue event"| rtapi
+    c1 <-->|"GET /next · POST /response"| rtapi
+    c2 <--> rtapi
+    c3 <--> rtapi
+    rtapi -->|"result"| api
+    api -->|"release(env)"| sched
 ```
-┌─────────────────┐
-│   FastAPI Server│  (main.py)
-│   Port: 9000    │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│   Scheduler     │  (scheduler.py)
-│  - get_env()    │  ← Manages warm containers
-│  - reaper()     │  ← Idle eviction thread
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│   RuntimeAPI    │  (runtime_api.py)
-│   Port: 5001    │  ← Containers call this
-│  - /next        │  ← Blocks until event
-│  - /response    │  ← Handler result
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│  Docker Container│ (runtime.py)
-│  - Polls /next   │
-│  - Calls handler │
-│  - Returns result│
-└──────────────────┘
+
+### Invocation Lifecycle (two-phase timeout)
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant M as main.py (:9000)
+    participant P as Pool
+    participant R as RuntimeAPI (:5001)
+    participant K as Container
+
+    C->>M: POST /invoke/hello
+    M->>P: acquire(hello)
+    alt free warm container
+        P-->>M: reuse (warm start)
+    else under MAX_PER_FN
+        P->>K: docker run -d (cold start)
+        P-->>M: new env
+    else pool full
+        P-->>M: block until release
+    end
+    M->>R: enqueue event (rid)
+    Note over R,K: Phase 1 — wait for pickup
+    K->>R: GET /{id}/next
+    R-->>K: event payload
+    Note over R,K: Phase 2 — wait for result (remaining budget)
+    K->>K: handler(event)
+    alt success
+        K->>R: POST /{rid}/response
+    else raises
+        K->>R: POST /{rid}/error
+    end
+    R-->>M: result / raise
+    M->>P: release(env)
+    M-->>C: JSON result / {errorMessage}
+    Note over M,K: on timeout in either phase → docker kill
 ```
 
 ## Usage
@@ -91,11 +132,12 @@ echo '{}' > functions/myfunction/event.json
 
 ## Configuration
 
-**Timeouts (scheduler.py):**
+**Knobs (scheduler.py):**
 
 ```python
-ENV.invoke(payload, timeout=15)  # Execution timeout
-IDLE_TIMEOUT = 30                 # Idle eviction
+MAX_PER_FN = 3    # warm containers per function (concurrency ceiling)
+IDLE_TIMEOUT = 30 # seconds idle before a container is evicted
+# per-invoke execution timeout: Environment.invoke(payload, timeout=15)
 ```
 
 ## What This Teaches
@@ -140,11 +182,7 @@ while rid not in self.responses:
 def reap_idle():
     while True:
         time.sleep(5)
-        if ENV and not ENV.dead:
-            idle = time.time() - ENV.last_used
-            if idle > IDLE_TIMEOUT:
-                ENV.kill("Idle eviction")
-                ENV = None
+        POOL.reap_idle()  # evicts idle, non-busy containers across every function pool
 ```
 
 ## Files
@@ -166,15 +204,16 @@ docker
 
 ## Real AWS Lambda Differences
 
-| Feature       | This Implementation  | Real AWS Lambda                 |
-| ------------- | -------------------- | ------------------------------- |
-| Timeout       | 15s                  | 1s - 900s (configurable)        |
-| Idle eviction | 30s                  | ~10-60 minutes (varies)         |
-| Concurrency   | 1 (single container) | Thousands (auto-scaling)        |
-| Cold start    | ~100ms               | 100ms - 10s (varies by runtime) |
-| Billing       | N/A                  | Per-ms, per-GB memory           |
+| Feature       | This Implementation              | Real AWS Lambda                 |
+| ------------- | -------------------------------- | ------------------------------- |
+| Timeout       | 15s                              | 1s - 900s (configurable)        |
+| Idle eviction | 30s                              | ~10-60 minutes (varies)         |
+| Concurrency   | N per function (pool, default 3) | Thousands (auto-scaling)        |
+| Cold start    | ~100ms                           | 100ms - 10s (varies by runtime) |
+| Billing       | N/A                              | Per-ms, per-GB memory           |
 
 ## Reference
+
 [AWS Lambda Architecture Deep Dive](https://joudwawad.medium.com/aws-lambda-architecture-deep-dive-bef856b9b2c4)
 
 ## License

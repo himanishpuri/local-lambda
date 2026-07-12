@@ -3,8 +3,9 @@ import json
 import os
 import aiofiles
 from fastapi import FastAPI, Request
-from pydantic import BaseModel
-from scheduler import get_env
+from starlette.concurrency import run_in_threadpool
+from scheduler import get_env, release
+from runtime_api import HandlerError
 
 app = FastAPI()
 
@@ -25,15 +26,25 @@ async def invoke(function_name: str, request: Request):
             content = await f.read()
             payload = json.loads(content)
 
-    env = get_env(function_name)
-    
+    # get_env may block (cold start / pool full) and invoke() blocks on the
+    # container — run both off the event loop so requests overlap across the pool
     try:
-        result = env.invoke(payload)
+        env = await run_in_threadpool(get_env, function_name)
+    except FileNotFoundError as e:
+        return {"errorMessage": str(e), "errorType": "FunctionNotFound"}
+
+    try:
+        result = await run_in_threadpool(env.invoke, payload)
         logging.info(f"Invocation result: {result}")
         return result
+    except HandlerError as e:
+        logging.error(f"Handler raised: {e}")
+        return {"errorMessage": str(e), "errorType": "HandlerError"}
     except Exception as e:
         logging.error(f"Invocation failed: {e}")
         return {"errorMessage": str(e), "errorType": "ExecutionError"}
+    finally:
+        release(env)
 
 if __name__ == "__main__":
     import uvicorn
